@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.IO;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media.Imaging;
@@ -213,10 +214,10 @@ public partial class MainWindow : Window
             Log($"Created backup branch: {backupBranch}");
 
             // Rewrite co-author lines
-            var progress = new Progress<string>(msg => Log(msg));
+            ShowProgress(true);
+            var progress = CreateStreamingProgress();
             var (rewritten, output) = await _git.RewriteHistoryAsync(_lastScannedRepoPath, branch, progress);
 
-            Log(output);
             Log($"Co-author rewrite complete. {rewritten} commit(s) processed.");
 
             // Rewrite author/committer if checked
@@ -231,12 +232,13 @@ public partial class MainWindow : Window
                 }
 
                 SetStatus("Rewriting commit authors...");
+                ProgressBar.Value = 0;
                 var (authorRewritten, authorOutput) = await _git.RewriteAuthorAsync(
                     _lastScannedRepoPath, branch, name, email, progress);
-                Log(authorOutput);
                 Log($"Author rewrite complete. {authorRewritten} commit(s) processed.");
             }
 
+            ShowProgress(false);
             SetStatus($"Done! Backup: {backupBranch}");
             SummaryText.Text = $"History cleaned. Backup branch: {backupBranch}. Use Force Push to update remote.";
 
@@ -250,6 +252,7 @@ public partial class MainWindow : Window
         }
         finally
         {
+            ShowProgress(false);
             SetButtons(true);
         }
     }
@@ -345,11 +348,12 @@ public partial class MainWindow : Window
                 : $"https://{token}@github.com/{owner}/{repo}.git";
 
             var tempDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "claude-b-gone");
-            var progress = new Progress<string>(msg => Log(msg));
+            var logProgress = new Progress<string>(msg => Log(msg));
+            var streamProgress = CreateStreamingProgress();
 
             // Step 1: Clone
             SetStatus("Cloning repository...");
-            clonePath = await _git.CloneRepoAsync(cloneUrl, tempDir, progress);
+            clonePath = await _git.CloneRepoAsync(cloneUrl, tempDir, logProgress);
             Log($"Cloned to: {clonePath}");
 
             // Determine branch
@@ -362,9 +366,9 @@ public partial class MainWindow : Window
             Log($"Created backup branch: {backupBranch}");
 
             // Step 3: Rewrite co-author lines
+            ShowProgress(true);
             SetStatus("Rewriting co-author lines...");
-            var (rewritten, output) = await _git.RewriteHistoryAsync(clonePath, targetBranch, progress);
-            Log(output);
+            var (rewritten, output) = await _git.RewriteHistoryAsync(clonePath, targetBranch, streamProgress);
             Log($"Co-author rewrite complete. {rewritten} commit(s) processed.");
 
             // Step 3b: Rewrite author/committer if checked
@@ -379,11 +383,13 @@ public partial class MainWindow : Window
                 }
 
                 SetStatus("Rewriting commit authors...");
+                ProgressBar.Value = 0;
                 var (authorRewritten, authorOutput) = await _git.RewriteAuthorAsync(
-                    clonePath, targetBranch, name, email, progress);
-                Log(authorOutput);
+                    clonePath, targetBranch, name, email, streamProgress);
                 Log($"Author rewrite complete. {authorRewritten} commit(s) processed.");
             }
+
+            ShowProgress(false);
 
             // Step 4: Confirm force push
             var pushConfirm = MessageBox.Show(
@@ -452,6 +458,7 @@ public partial class MainWindow : Window
         }
         finally
         {
+            ShowProgress(false);
             SetButtons(true);
             CloneCleanButton.IsEnabled = false;
         }
@@ -476,9 +483,56 @@ public partial class MainWindow : Window
 
     private void Log(string message)
     {
-        var timestamp = DateTime.Now.ToString("HH:mm:ss");
-        LogBox.AppendText($"[{timestamp}] {message}\n");
-        LogBox.ScrollToEnd();
+        Dispatcher.Invoke(() =>
+        {
+            var timestamp = DateTime.Now.ToString("HH:mm:ss");
+            LogBox.AppendText($"[{timestamp}] {message}\n");
+            LogBox.ScrollToEnd();
+        });
+    }
+
+    private void ShowProgress(bool visible)
+    {
+        Dispatcher.Invoke(() =>
+        {
+            ProgressPanel.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+            if (!visible)
+            {
+                ProgressBar.Value = 0;
+                ProgressText.Text = "";
+            }
+        });
+    }
+
+    private void UpdateProgress(string line)
+    {
+        // Parse filter-branch output like "Rewrite abc1234 (42/217) (3 seconds passed, remaining ...)"
+        var match = Regex.Match(line, @"\((\d+)/(\d+)\)");
+        if (match.Success)
+        {
+            var current = int.Parse(match.Groups[1].Value);
+            var total = int.Parse(match.Groups[2].Value);
+            var pct = total > 0 ? (double)current / total * 100 : 0;
+
+            Dispatcher.Invoke(() =>
+            {
+                ProgressPanel.Visibility = Visibility.Visible;
+                ProgressBar.Value = pct;
+                ProgressText.Text = $"{current}/{total}";
+                SetStatus($"Rewriting... {current}/{total} ({pct:F0}%)");
+            });
+        }
+    }
+
+    private IProgress<string> CreateStreamingProgress()
+    {
+        return new Progress<string>(line =>
+        {
+            UpdateProgress(line);
+            // Only log non-Rewrite lines to avoid flooding the log
+            if (!line.TrimStart().StartsWith("Rewrite"))
+                Log(line);
+        });
     }
 }
 

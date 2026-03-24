@@ -219,11 +219,25 @@
             </ListView>
         </Border>
 
-        <!-- Summary bar -->
+        <!-- Progress bar + Summary bar -->
         <Border Grid.Row="4" Background="{StaticResource BgSecondary}" CornerRadius="8"
                 Padding="12,8" Margin="0,12,0,0">
-            <TextBlock x:Name="SummaryText" Text="Ready. Enter a repository path or GitHub owner/repo and click Scan."
-                       Foreground="{StaticResource TextSecondary}" FontSize="13"/>
+            <StackPanel>
+                <Grid x:Name="ProgressPanel" Visibility="Collapsed" Margin="0,0,0,8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <ProgressBar x:Name="ProgressBar" Height="18" Minimum="0" Maximum="100" Value="0"
+                                 Background="{StaticResource BgTertiary}" Foreground="{StaticResource AccentBlue}"
+                                 BorderThickness="0"/>
+                    <TextBlock x:Name="ProgressText" Grid.Column="1" Foreground="{StaticResource TextPrimary}"
+                               FontSize="12" VerticalAlignment="Center" Margin="10,0,0,0"
+                               FontFamily="Cascadia Code,Consolas,Courier New"/>
+                </Grid>
+                <TextBlock x:Name="SummaryText" Text="Ready. Enter a repository path or GitHub owner/repo and click Scan."
+                           Foreground="{StaticResource TextSecondary}" FontSize="13"/>
+            </StackPanel>
         </Border>
 
         <!-- Log output -->

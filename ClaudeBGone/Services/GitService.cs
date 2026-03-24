@@ -191,7 +191,8 @@ public class GitService
         var sedPattern = @"/^[[:space:]]*[Cc]o-[Aa]uthored-[Bb]y:.*Claude.*@anthropic\.com/d";
         var filterCmd = $"filter-branch --force --msg-filter \"sed '{sedPattern}'\" -- {branch}";
 
-        var (exitCode, output, error) = await RunGitAsync(repoPath, filterCmd, timeoutSeconds: 600);
+        var (exitCode, output, error) = await RunProcessAsync(
+            "git", filterCmd, repoPath, timeoutSeconds: 600, lineProgress: progress);
 
         if (exitCode != 0)
         {
@@ -266,7 +267,8 @@ public class GitService
             $"export GIT_COMMITTER_EMAIL='{EscapeShell(newEmail)}'; fi";
 
         var filterCmd = $"filter-branch --force --env-filter \"{envFilter}\" -- {branch}";
-        var (exitCode, output, error) = await RunGitAsync(repoPath, filterCmd, timeoutSeconds: 600);
+        var (exitCode, output, error) = await RunProcessAsync(
+            "git", filterCmd, repoPath, timeoutSeconds: 600, lineProgress: progress);
 
         if (exitCode != 0)
         {
@@ -359,7 +361,8 @@ public class GitService
     }
 
     private static async Task<(int exitCode, string output, string error)> RunProcessAsync(
-        string fileName, string arguments, string workingDir, int timeoutSeconds = 30)
+        string fileName, string arguments, string workingDir, int timeoutSeconds = 30,
+        IProgress<string>? lineProgress = null)
     {
         using var process = new Process();
         process.StartInfo = new ProcessStartInfo
@@ -375,19 +378,76 @@ public class GitService
 
         process.Start();
 
-        var outputTask = process.StandardOutput.ReadToEndAsync();
-        var errorTask = process.StandardError.ReadToEndAsync();
-
-        var completed = await Task.Run(() => process.WaitForExit(timeoutSeconds * 1000));
-        if (!completed)
+        // If we have a progress reporter, stream stderr line by line (filter-branch writes progress there)
+        if (lineProgress != null)
         {
-            process.Kill();
-            return (-1, "", "Process timed out");
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorLines = new System.Text.StringBuilder();
+
+            // Read stderr char-by-char because git filter-branch uses \r (not \n)
+            // to overwrite progress lines in-place
+            _ = Task.Run(async () =>
+            {
+                var buffer = new char[1];
+                var lineBuffer = new System.Text.StringBuilder();
+                var reader = process.StandardError;
+
+                while (true)
+                {
+                    var charsRead = await reader.ReadAsync(buffer, 0, 1);
+                    if (charsRead == 0) break; // EOF
+
+                    var ch = buffer[0];
+                    if (ch == '\r' || ch == '\n')
+                    {
+                        if (lineBuffer.Length > 0)
+                        {
+                            var line = lineBuffer.ToString();
+                            errorLines.AppendLine(line);
+                            lineProgress.Report(line);
+                            lineBuffer.Clear();
+                        }
+                    }
+                    else
+                    {
+                        lineBuffer.Append(ch);
+                    }
+                }
+
+                // Flush remaining
+                if (lineBuffer.Length > 0)
+                {
+                    var line = lineBuffer.ToString();
+                    errorLines.AppendLine(line);
+                    lineProgress.Report(line);
+                }
+            });
+
+            var completed = await Task.Run(() => process.WaitForExit(timeoutSeconds * 1000));
+            if (!completed)
+            {
+                process.Kill();
+                return (-1, "", "Process timed out");
+            }
+
+            var output = await outputTask;
+            return (process.ExitCode, output, errorLines.ToString());
         }
+        else
+        {
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
 
-        var output = await outputTask;
-        var error = await errorTask;
+            var completed = await Task.Run(() => process.WaitForExit(timeoutSeconds * 1000));
+            if (!completed)
+            {
+                process.Kill();
+                return (-1, "", "Process timed out");
+            }
 
-        return (process.ExitCode, output, error);
+            var output = await outputTask;
+            var error = await errorTask;
+            return (process.ExitCode, output, error);
+        }
     }
 }
