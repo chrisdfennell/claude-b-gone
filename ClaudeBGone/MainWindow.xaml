@@ -4,7 +4,7 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
-        Title="Claude-B-Gone" Height="700" Width="950"
+        Title="Claude-B-Gone v1.1" Height="700" Width="950"
         MinHeight="500" MinWidth="700"
         WindowStartupLocation="CenterScreen"
         Background="#1e1e2e">

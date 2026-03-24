@@ -347,22 +347,37 @@ public partial class MainWindow : Window
             // If we worked on a local clone, push back to origin
             if (isNetwork && localClonePath != null)
             {
+                var pushFailed = false;
                 foreach (var branch in branchesToProcess)
                 {
                     SetStatus($"Pushing {branch} back to origin...");
                     var (pushOk, pushOut) = await _git.ForcePushAsync(localClonePath, branch);
-                    Log(pushOut);
-                    if (!pushOk)
+                    if (!string.IsNullOrWhiteSpace(pushOut))
+                        Log(pushOut);
+                    if (pushOk)
+                        Log($"Pushed {branch} successfully.");
+                    else
+                    {
                         Log($"Warning: push failed for {branch}");
+                        pushFailed = true;
+                    }
                 }
-                SetStatus("Done! Run 'git fetch --all && git reset --hard' in your network repo to sync.");
+
+                if (!pushFailed)
+                {
+                    Log("All branches pushed. Running automatic cleanup...");
+                    SetStatus("Cleaning up...");
+                    var cleanupResult = await _git.CleanupFilterBranchLeftoversAsync(
+                        repoPath, new Progress<string>(msg => Log(msg)));
+                    Log(cleanupResult);
+                }
             }
 
             var branchList = string.Join(", ", branchesToProcess);
             ShowProgress(false);
             SetStatus($"Done! {totalRewritten} commits rewritten across {branchesToProcess.Count} branch(es).");
             SummaryText.Text = isNetwork
-                ? $"History cleaned and pushed. Backup: {backupBranch}."
+                ? $"History cleaned and pushed across [{branchList}]."
                 : $"History cleaned on [{branchList}]. Backup: {backupBranch}. Use Force Push to update remote.";
 
             if (!isNetwork)
