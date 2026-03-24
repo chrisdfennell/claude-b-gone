@@ -1,0 +1,26 @@
+## Build output
+bin/
+obj/
+
+## User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## VS Code
+.vscode/
+
+## Visual Studio
+.vs/
+
+## Claude Code
+.claude/
+
+## OS files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+## Publish output
+C:/ClaudeBGone/
