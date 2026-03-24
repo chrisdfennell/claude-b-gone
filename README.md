@@ -310,3 +310,5 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 - **Use at your own risk.** Always verify the results before force pushing, and make sure all collaborators are informed.
 
 This tool is not affiliated with Anthropic.
+
+**BY USING THIS SOFTWARE, YOU ACCEPT FULL RESPONSIBILITY FOR ANY CHANGES MADE TO YOUR REPOSITORIES.** The author is not responsible for any data loss, corrupted repositories, broken CI/CD pipelines, lost commits, or any other damage resulting from the use of this tool. You are rewriting git history at your own risk. Always verify your backups before force pushing.
