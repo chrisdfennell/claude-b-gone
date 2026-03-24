@@ -40,6 +40,51 @@ public partial class MainWindow : Window
         }
     }
 
+    private const string AllBranchesItem = "-- All Branches --";
+
+    private string? GetSelectedBranch()
+    {
+        var selected = BranchCombo.SelectedItem?.ToString();
+        if (selected == null || selected == AllBranchesItem)
+            return null;
+        return selected;
+    }
+
+    private bool IsAllBranchesSelected => BranchCombo.SelectedItem?.ToString() == AllBranchesItem;
+
+    private async void RefreshBranches_Click(object sender, RoutedEventArgs e)
+    {
+        if (LocalModeRadio.IsChecked == true)
+        {
+            var path = RepoPathBox.Text.Trim();
+            if (string.IsNullOrEmpty(path) || !await _git.IsGitRepoAsync(path))
+            {
+                SetStatus("Enter a valid repo path first.");
+                return;
+            }
+            await LoadBranchesAsync(path);
+        }
+        else
+        {
+            SetStatus("Use Scan to detect branches for GitHub repos.");
+        }
+    }
+
+    private async Task LoadBranchesAsync(string repoPath)
+    {
+        var branches = await _git.GetBranchesAsync(repoPath);
+        var currentBranch = await _git.GetCurrentBranchAsync(repoPath);
+
+        BranchCombo.Items.Clear();
+        BranchCombo.Items.Add(AllBranchesItem);
+        foreach (var b in branches)
+            BranchCombo.Items.Add(b);
+
+        // Select current branch by default
+        var idx = BranchCombo.Items.IndexOf(currentBranch);
+        BranchCombo.SelectedIndex = idx >= 0 ? idx : (branches.Count > 0 ? 1 : 0);
+    }
+
     private void Mode_Changed(object sender, RoutedEventArgs e)
     {
         if (LocalPanel == null || GitHubPanel == null) return;
@@ -113,27 +158,52 @@ public partial class MainWindow : Window
             return;
         }
 
-        var branch = string.IsNullOrWhiteSpace(BranchBox.Text) ? null : BranchBox.Text.Trim();
-        Log($"Scanning local repo: {path} (branch: {branch ?? "current"})...");
+        // Save selection before loading branches (loading resets the combo)
+        var wasAllBranches = IsAllBranchesSelected;
+        var savedBranch = GetSelectedBranch();
 
-        var commits = await _git.GetClaudeCommitsAsync(path, branch);
-        var authorCommits = await _git.GetClaudeAuthoredCommitsAsync(path, branch);
+        // Auto-load branches into combo box (only if empty)
+        if (BranchCombo.Items.Count == 0)
+            await LoadBranchesAsync(path);
+
+        // Scan selected branch or all branches
+        var branches = wasAllBranches
+            ? await _git.GetBranchesAsync(path)
+            : new List<string> { savedBranch ?? "HEAD" };
+
+        var allCommits = new List<CommitInfo>();
+        var allAuthorCommits = new List<AuthorCommitInfo>();
+        var scannedBranches = new List<string>();
+
+        foreach (var branch in branches)
+        {
+            Log($"Scanning local repo: {path} (branch: {branch ?? "current"})...");
+            var commits = await _git.GetClaudeCommitsAsync(path, branch);
+            var authorCommits = await _git.GetClaudeAuthoredCommitsAsync(path, branch);
+            allCommits.AddRange(commits);
+            allAuthorCommits.AddRange(authorCommits);
+            if (branch != null) scannedBranches.Add(branch);
+        }
+
+        // Deduplicate by hash
+        var seenHashes = new HashSet<string>();
+        var commits2 = allCommits.Where(c => seenHashes.Add(c.Hash)).ToList();
+        var authorCommits2 = allAuthorCommits.Where(c => seenHashes.Add(c.Hash)).ToList();
+
         _lastScannedRepoPath = path;
 
-        foreach (var c in commits)
+        foreach (var c in commits2)
         {
             _commits.Add(new CommitDisplayItem(c.ShortHash, c.Date, c.Subject, c.CoAuthorLine));
         }
 
-        // Add author commits that aren't already in the list
-        var existingHashes = commits.Select(c => c.ShortHash).ToHashSet();
-        foreach (var c in authorCommits.Where(a => !existingHashes.Contains(a.ShortHash)))
+        foreach (var c in authorCommits2)
         {
             _commits.Add(new CommitDisplayItem(c.ShortHash, c.Date, c.Subject, $"Author: {c.AuthorName} <{c.AuthorEmail}>"));
         }
 
         var totalFound = _commits.Count;
-        var summary = $"Found {commits.Count} co-author commit(s) and {authorCommits.Count} Claude-authored commit(s).";
+        var summary = $"Found {commits2.Count} co-author commit(s) and {authorCommits2.Count} Claude-authored commit(s).";
         SummaryText.Text = summary;
         Log(summary);
         SetStatus(totalFound > 0 ? $"{totalFound} commits found" : "No Claude commits found.");
@@ -156,7 +226,7 @@ public partial class MainWindow : Window
         var parts = repoInput.Split('/', 2);
         var token = GitHubTokenBox.Password;
         var github = new GitHubService(string.IsNullOrWhiteSpace(token) ? null : token);
-        var branch = string.IsNullOrWhiteSpace(BranchBox.Text) ? null : BranchBox.Text.Trim();
+        var branch = GetSelectedBranch();
 
         Log($"Scanning GitHub repo: {repoInput} (branch: {branch ?? "default"})...");
         var progress = new Progress<string>(msg => Log(msg));
@@ -182,13 +252,20 @@ public partial class MainWindow : Window
     {
         if (_lastScannedRepoPath == null) return;
 
-        var result = MessageBox.Show(
-            $"This will rewrite git history in:\n{_lastScannedRepoPath}\n\n" +
-            "A backup branch will be created first.\n\n" +
-            "Are you sure you want to continue?",
-            "Confirm History Rewrite",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning);
+        var repoPath = _lastScannedRepoPath;
+        string? localClonePath = null;
+        // Only clone locally for network drives with many commits (50+)
+        var isNetwork = GitService.IsNetworkPath(repoPath) && _commits.Count >= 50;
+
+        var warningMsg = $"This will rewrite git history in:\n{repoPath}\n\n" +
+            "A backup branch will be created first.\n\n";
+        if (isNetwork)
+            warningMsg += "NOTE: Repo is on a network drive with many commits. It will be cloned locally for speed, " +
+                          "then pushed back.\n\n";
+        warningMsg += "Are you sure you want to continue?";
+
+        var result = MessageBox.Show(warningMsg, "Confirm History Rewrite",
+            MessageBoxButton.YesNo, MessageBoxImage.Warning);
 
         if (result != MessageBoxResult.Yes) return;
 
@@ -198,51 +275,98 @@ public partial class MainWindow : Window
         try
         {
             // Check for uncommitted changes
-            if (await _git.HasUncommittedChangesAsync(_lastScannedRepoPath))
+            if (await _git.HasUncommittedChangesAsync(repoPath))
             {
                 SetStatus("Aborted: uncommitted changes detected. Commit or stash first.");
                 Log("Cannot rewrite history with uncommitted changes.");
                 return;
             }
 
-            var branch = string.IsNullOrWhiteSpace(BranchBox.Text)
-                ? await _git.GetCurrentBranchAsync(_lastScannedRepoPath)
-                : BranchBox.Text.Trim();
+            // Determine branches to process
+            var branchesToProcess = (IsAllBranchesSelected
+                ? await _git.GetBranchesAsync(repoPath)
+                : new List<string> { GetSelectedBranch() ?? await _git.GetCurrentBranchAsync(repoPath) })
+                .Where(b => !b.StartsWith("pre-claude-b-gone-")).ToList();
 
-            // Create backup
-            var backupBranch = await _git.CreateBackupBranchAsync(_lastScannedRepoPath, branch);
-            Log($"Created backup branch: {backupBranch}");
-
-            // Rewrite co-author lines
-            ShowProgress(true);
-            var progress = CreateStreamingProgress();
-            var (rewritten, output) = await _git.RewriteHistoryAsync(_lastScannedRepoPath, branch, progress);
-
-            Log($"Co-author rewrite complete. {rewritten} commit(s) processed.");
-
-            // Rewrite author/committer if checked
-            if (RewriteAuthorCheck.IsChecked == true)
+            // If on a network drive, clone locally first for speed
+            var workPath = repoPath;
+            if (isNetwork)
             {
-                var name = AuthorNameBox.Text.Trim();
-                var email = AuthorEmailBox.Text.Trim();
-                if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(email))
-                {
-                    SetStatus("Please enter your name and email for author rewrite.");
-                    return;
-                }
-
-                SetStatus("Rewriting commit authors...");
-                ProgressBar.Value = 0;
-                var (authorRewritten, authorOutput) = await _git.RewriteAuthorAsync(
-                    _lastScannedRepoPath, branch, name, email, progress);
-                Log($"Author rewrite complete. {authorRewritten} commit(s) processed.");
+                SetStatus("Cloning to local drive for speed...");
+                var remoteUrl = await _git.GetRemoteUrlAsync(repoPath);
+                if (remoteUrl == null)
+                    remoteUrl = repoPath;
+                var tempDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "claude-b-gone");
+                var logProgress = new Progress<string>(msg => Log(msg));
+                localClonePath = await _git.CloneRepoAsync(remoteUrl, tempDir, logProgress);
+                workPath = localClonePath;
+                Log($"Working on local clone: {workPath}");
             }
 
-            ShowProgress(false);
-            SetStatus($"Done! Backup: {backupBranch}");
-            SummaryText.Text = $"History cleaned. Backup branch: {backupBranch}. Use Force Push to update remote.";
+            // Create backup on original repo (first branch)
+            var backupBranch = await _git.CreateBackupBranchAsync(repoPath, branchesToProcess[0]);
+            Log($"Created backup branch: {backupBranch}");
 
-            ForcePushButton.IsEnabled = true;
+            ShowProgress(true);
+            var progress = CreateStreamingProgress();
+            var totalRewritten = 0;
+
+            foreach (var branch in branchesToProcess)
+            {
+                Log($"Processing branch: {branch}");
+
+                // Checkout the branch if working on a clone
+                if (isNetwork && localClonePath != null)
+                    await _git.CheckoutBranchAsync(workPath, branch);
+
+                // Rewrite co-author lines
+                SetStatus($"Rewriting co-author lines on {branch}...");
+                var (rewritten, _) = await _git.RewriteHistoryAsync(workPath, branch, progress);
+                Log($"Co-author rewrite on {branch}: {rewritten} commit(s) processed.");
+                totalRewritten += rewritten;
+
+                // Rewrite author/committer if checked
+                if (RewriteAuthorCheck.IsChecked == true)
+                {
+                    var name = AuthorNameBox.Text.Trim();
+                    var email = AuthorEmailBox.Text.Trim();
+                    if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(email))
+                    {
+                        SetStatus("Please enter your name and email for author rewrite.");
+                        return;
+                    }
+
+                    SetStatus($"Rewriting commit authors on {branch}...");
+                    ProgressBar.Value = 0;
+                    var (authorRewritten, _) = await _git.RewriteAuthorAsync(
+                        workPath, branch, name, email, progress);
+                    Log($"Author rewrite on {branch}: {authorRewritten} commit(s) processed.");
+                }
+            }
+
+            // If we worked on a local clone, push back to origin
+            if (isNetwork && localClonePath != null)
+            {
+                foreach (var branch in branchesToProcess)
+                {
+                    SetStatus($"Pushing {branch} back to origin...");
+                    var (pushOk, pushOut) = await _git.ForcePushAsync(localClonePath, branch);
+                    Log(pushOut);
+                    if (!pushOk)
+                        Log($"Warning: push failed for {branch}");
+                }
+                SetStatus("Done! Run 'git fetch --all && git reset --hard' in your network repo to sync.");
+            }
+
+            var branchList = string.Join(", ", branchesToProcess);
+            ShowProgress(false);
+            SetStatus($"Done! {totalRewritten} commits rewritten across {branchesToProcess.Count} branch(es).");
+            SummaryText.Text = isNetwork
+                ? $"History cleaned and pushed. Backup: {backupBranch}."
+                : $"History cleaned on [{branchList}]. Backup: {backupBranch}. Use Force Push to update remote.";
+
+            if (!isNetwork)
+                ForcePushButton.IsEnabled = true;
             CleanButton.IsEnabled = false;
         }
         catch (Exception ex)
@@ -254,6 +378,13 @@ public partial class MainWindow : Window
         {
             ShowProgress(false);
             SetButtons(true);
+
+            // Clean up temp clone
+            if (localClonePath != null)
+            {
+                try { GitService.ForceDeleteDirectory(localClonePath); }
+                catch { Log($"Temp clone remains at: {localClonePath}"); }
+            }
         }
     }
 
@@ -261,12 +392,14 @@ public partial class MainWindow : Window
     {
         if (_lastScannedRepoPath == null) return;
 
-        var branch = string.IsNullOrWhiteSpace(BranchBox.Text)
-            ? await _git.GetCurrentBranchAsync(_lastScannedRepoPath)
-            : BranchBox.Text.Trim();
+        var branchesToPush = (IsAllBranchesSelected
+            ? await _git.GetBranchesAsync(_lastScannedRepoPath)
+            : new List<string> { GetSelectedBranch() ?? await _git.GetCurrentBranchAsync(_lastScannedRepoPath) })
+            .Where(b => !b.StartsWith("pre-claude-b-gone-")).ToList();
 
+        var branchList = string.Join(", ", branchesToPush);
         var result = MessageBox.Show(
-            $"This will FORCE PUSH branch '{branch}' to origin.\n\n" +
+            $"This will FORCE PUSH branch(es): {branchList}\n\n" +
             "This rewrites remote history and cannot be undone.\n" +
             "Make sure all collaborators are aware.\n\n" +
             "Continue?",
@@ -281,18 +414,34 @@ public partial class MainWindow : Window
 
         try
         {
-            var (success, output) = await _git.ForcePushAsync(_lastScannedRepoPath, branch);
-            Log(output);
-
-            if (success)
+            var allSuccess = true;
+            foreach (var branch in branchesToPush)
             {
-                SetStatus("Force push successful!");
-                SummaryText.Text = $"Branch '{branch}' has been force-pushed to origin. Claude co-author lines removed.";
+                SetStatus($"Force pushing {branch}...");
+                var (success, output) = await _git.ForcePushAsync(_lastScannedRepoPath, branch);
+                Log(output);
+                if (!success)
+                {
+                    Log($"Warning: Force push failed for {branch}");
+                    allSuccess = false;
+                }
+            }
+
+            if (allSuccess)
+            {
+                Log("All branches pushed. Running automatic cleanup...");
+                SetStatus("Cleaning up filter-branch leftovers...");
+                var cleanupResult = await _git.CleanupFilterBranchLeftoversAsync(
+                    _lastScannedRepoPath, new Progress<string>(msg => Log(msg)));
+                Log(cleanupResult);
+
+                SetStatus("Force push successful! Cleanup complete.");
+                SummaryText.Text = $"Pushed [{branchList}] to origin. Claude co-author lines removed. Leftovers cleaned.";
                 ForcePushButton.IsEnabled = false;
             }
             else
             {
-                SetStatus("Force push failed. Check log.");
+                SetStatus("Some branches failed to push. Check log.");
             }
         }
         catch (Exception ex)
@@ -310,6 +459,7 @@ public partial class MainWindow : Window
     {
         var repoInput = GitHubRepoBox.Text.Trim();
         if (string.IsNullOrEmpty(repoInput) || !repoInput.Contains('/'))
+
         {
             SetStatus("Please enter owner/repo.");
             return;
@@ -319,7 +469,7 @@ public partial class MainWindow : Window
         var owner = parts[0];
         var repo = parts[1];
         var token = GitHubTokenBox.Password;
-        var branch = string.IsNullOrWhiteSpace(BranchBox.Text) ? null : BranchBox.Text.Trim();
+        var branch = GetSelectedBranch();
 
         // Confirmation dialog
         var confirm = MessageBox.Show(
@@ -356,8 +506,9 @@ public partial class MainWindow : Window
             clonePath = await _git.CloneRepoAsync(cloneUrl, tempDir, logProgress);
             Log($"Cloned to: {clonePath}");
 
-            // Determine branch
+            // Determine branch and checkout
             var targetBranch = branch ?? await _git.GetCurrentBranchAsync(clonePath);
+            await _git.CheckoutBranchAsync(clonePath, targetBranch);
             Log($"Target branch: {targetBranch}");
 
             // Step 2: Create backup branch
@@ -435,7 +586,7 @@ public partial class MainWindow : Window
             {
                 try
                 {
-                    System.IO.Directory.Delete(clonePath, true);
+                    GitService.ForceDeleteDirectory(clonePath);
                     Log("Temporary clone deleted.");
                 }
                 catch (Exception delEx)
@@ -461,6 +612,56 @@ public partial class MainWindow : Window
             ShowProgress(false);
             SetButtons(true);
             CloneCleanButton.IsEnabled = false;
+        }
+    }
+
+    private async void Cleanup_Click(object sender, RoutedEventArgs e)
+    {
+        var path = LocalModeRadio.IsChecked == true ? RepoPathBox.Text.Trim() : _lastScannedRepoPath;
+        if (string.IsNullOrEmpty(path))
+        {
+            SetStatus("Enter a repo path first.");
+            return;
+        }
+
+        if (!await _git.IsGitRepoAsync(path))
+        {
+            SetStatus("Not a valid git repository.");
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            "This will remove:\n\n" +
+            "- .git-rewrite directory\n" +
+            "- refs/original backup refs\n" +
+            "- pre-claude-b-gone-* backup branches\n" +
+            "- Run git gc to reclaim space\n\n" +
+            "Continue?",
+            "Confirm Cleanup",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+
+        if (confirm != MessageBoxResult.Yes) return;
+
+        SetButtons(false);
+        SetStatus("Cleaning up...");
+
+        try
+        {
+            var result = await _git.CleanupFilterBranchLeftoversAsync(
+                path, new Progress<string>(msg => Log(msg)));
+            Log(result);
+            SetStatus("Cleanup complete.");
+            SummaryText.Text = result;
+        }
+        catch (Exception ex)
+        {
+            Log($"Cleanup error: {ex.Message}");
+            SetStatus("Cleanup failed.");
+        }
+        finally
+        {
+            SetButtons(true);
         }
     }
 
@@ -526,13 +727,22 @@ public partial class MainWindow : Window
 
     private IProgress<string> CreateStreamingProgress()
     {
-        return new Progress<string>(line =>
+        // Use a custom IProgress that dispatches directly to the UI thread
+        // instead of Progress<T> which uses SynchronizationContext.Post (can drop/batch updates)
+        return new DirectProgress(line =>
         {
-            UpdateProgress(line);
-            // Only log non-Rewrite lines to avoid flooding the log
-            if (!line.TrimStart().StartsWith("Rewrite"))
-                Log(line);
+            Dispatcher.Invoke(() =>
+            {
+                UpdateProgress(line);
+                if (!line.TrimStart().StartsWith("Rewrite"))
+                    Log(line);
+            });
         });
+    }
+
+    private class DirectProgress(Action<string> callback) : IProgress<string>
+    {
+        public void Report(string value) => callback(value);
     }
 }
 

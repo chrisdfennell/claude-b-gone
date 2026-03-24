@@ -81,6 +81,79 @@
             <Setter Property="FontSize" Value="13"/>
             <Setter Property="CaretBrush" Value="{StaticResource TextPrimary}"/>
         </Style>
+        <!-- ComboBox dark toggle button -->
+        <ControlTemplate x:Key="DarkComboBoxToggle" TargetType="ToggleButton">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition/>
+                    <ColumnDefinition Width="20"/>
+                </Grid.ColumnDefinitions>
+                <Border x:Name="Border" Grid.ColumnSpan="2" Background="#313244"
+                        BorderBrush="#585b70" BorderThickness="1" CornerRadius="3"/>
+                <Path x:Name="Arrow" Grid.Column="1" Fill="#cdd6f4"
+                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                      Data="M 0 0 L 4 4 L 8 0 Z"/>
+            </Grid>
+        </ControlTemplate>
+
+        <!-- ComboBox dark style -->
+        <Style x:Key="DarkComboBox" TargetType="ComboBox">
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <ToggleButton Template="{StaticResource DarkComboBoxToggle}"
+                                          IsChecked="{Binding Path=IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                          Focusable="False" ClickMode="Press"/>
+                            <ContentPresenter x:Name="ContentSite" IsHitTestVisible="False"
+                                              Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              Margin="10,4,28,4" VerticalAlignment="Center"
+                                              HorizontalAlignment="Left"/>
+                            <Popup x:Name="Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   AllowsTransparency="True" Focusable="False" PopupAnimation="Slide">
+                                <Grid x:Name="DropDown" SnapsToDevicePixels="True"
+                                      MinWidth="{TemplateBinding ActualWidth}" MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                                    <Border x:Name="DropDownBorder" Background="#313244"
+                                            BorderBrush="#585b70" BorderThickness="1" CornerRadius="3"/>
+                                    <ScrollViewer Margin="2" SnapsToDevicePixels="True">
+                                        <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Contained"/>
+                                    </ScrollViewer>
+                                </Grid>
+                            </Popup>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Setter Property="ItemContainerStyle">
+                <Setter.Value>
+                    <Style TargetType="ComboBoxItem">
+                        <Setter Property="Background" Value="#313244"/>
+                        <Setter Property="Foreground" Value="#cdd6f4"/>
+                        <Setter Property="Padding" Value="8,4"/>
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="ComboBoxItem">
+                                    <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+                                        <ContentPresenter/>
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsHighlighted" Value="True">
+                                            <Setter Property="Background" Value="#45475a"/>
+                                        </Trigger>
+                                        <Trigger Property="IsSelected" Value="True">
+                                            <Setter Property="Background" Value="#585b70"/>
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </Setter.Value>
+            </Setter>
+        </Style>
     </Window.Resources>
 
     <Grid Margin="20">
@@ -162,8 +235,13 @@
                     <StackPanel Orientation="Horizontal">
                         <TextBlock Text="Branch:" Foreground="{StaticResource TextSecondary}"
                                    VerticalAlignment="Center" Margin="0,0,8,0" FontSize="13"/>
-                        <TextBox x:Name="BranchBox" Style="{StaticResource DarkTextBox}" Width="200"
-                                 Text="" ToolTip="Leave empty for current/default branch"/>
+                        <ComboBox x:Name="BranchCombo" Width="220" IsEditable="False"
+                                  Style="{StaticResource DarkComboBox}"
+                                  ToolTip="Select a branch or All Branches"/>
+                        <Button x:Name="RefreshBranchesButton" Content="Refresh"
+                                Style="{StaticResource SecondaryButton}" Margin="8,0,0,0"
+                                Click="RefreshBranches_Click"
+                                ToolTip="Detect branches from repo"/>
                     </StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                         <CheckBox x:Name="RewriteAuthorCheck" Content="Also rewrite commit author (removes Claude from Contributors)"
@@ -195,6 +273,9 @@
             <Button x:Name="CloneCleanButton" Content="Clone, Clean &amp; Push" Margin="10,0,0,0"
                     Style="{StaticResource DangerButton}" Click="CloneAndClean_Click" IsEnabled="False"
                     Visibility="Collapsed"/>
+            <Button x:Name="CleanupButton" Content="Cleanup Leftovers" Margin="10,0,0,0"
+                    Style="{StaticResource SecondaryButton}" Click="Cleanup_Click"
+                    ToolTip="Remove .git-rewrite, refs/original, and backup branches left by filter-branch"/>
             <TextBlock x:Name="StatusText" Text="" Foreground="{StaticResource AccentYellow}"
                        VerticalAlignment="Center" Margin="16,0,0,0" FontSize="13"/>
         </StackPanel>

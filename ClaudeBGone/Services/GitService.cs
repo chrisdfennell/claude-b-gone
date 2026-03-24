@@ -8,6 +8,22 @@ public record AuthorCommitInfo(string Hash, string ShortHash, string Date, strin
 
 public class GitService
 {
+    public static bool IsNetworkPath(string path)
+    {
+        try
+        {
+            var root = Path.GetPathRoot(path);
+            if (root != null && root.StartsWith("\\\\")) return true; // UNC path
+            if (root != null && root.Length >= 2 && char.IsLetter(root[0]) && root[1] == ':')
+            {
+                var driveInfo = new DriveInfo(root[0].ToString());
+                return driveInfo.DriveType == DriveType.Network;
+            }
+        }
+        catch { }
+        return false;
+    }
+
     public async Task<string> GetGitVersionAsync()
     {
         var (exitCode, output, _) = await RunGitAsync(".", "--version");
@@ -24,6 +40,23 @@ public class GitService
     {
         var (exitCode, output, _) = await RunGitAsync(repoPath, "rev-parse --abbrev-ref HEAD");
         return exitCode == 0 ? output.Trim() : "unknown";
+    }
+
+    public async Task CheckoutBranchAsync(string repoPath, string branch)
+    {
+        // Check if already on the right branch
+        var current = await GetCurrentBranchAsync(repoPath);
+        if (current == branch) return;
+
+        // Try checking out - might be a remote tracking branch
+        var (exitCode, _, error) = await RunGitAsync(repoPath, $"checkout {branch}");
+        if (exitCode != 0)
+        {
+            // Try creating from remote
+            var (exitCode2, _, error2) = await RunGitAsync(repoPath, $"checkout -b {branch} origin/{branch}");
+            if (exitCode2 != 0)
+                throw new InvalidOperationException($"Could not checkout branch '{branch}': {error2}");
+        }
     }
 
     public async Task<List<string>> GetBranchesAsync(string repoPath)
@@ -91,13 +124,8 @@ public class GitService
     public async Task<(int rewritten, string output)> RewriteHistoryAsync(
         string repoPath, string branch, IProgress<string>? progress = null)
     {
-        // Try git-filter-repo first (much faster), fall back to filter-branch
-        var filterRepoPath = FindFilterRepo();
-        if (filterRepoPath != null)
-        {
-            return await RewriteWithFilterRepoAsync(repoPath, branch, filterRepoPath, progress);
-        }
-
+        // Use filter-branch for message rewriting — filter-repo's callback scoping
+        // is too fragile on Windows. filter-branch with sed is reliable and fast on local clones.
         return await RewriteWithFilterBranchAsync(repoPath, branch, progress);
     }
 
@@ -147,32 +175,34 @@ public class GitService
     {
         progress?.Report("Using git-filter-repo (fast mode)...");
 
-        // Write a small Python callback script to a temp file
-        var callbackScript = Path.Combine(Path.GetTempPath(), "claude-b-gone-msg-callback.py");
-        var scriptContent = """
-                            import re
-                            pattern = re.compile(rb'^\s*[Cc]o-[Aa]uthored-[Bb]y:\s*Claude.*@anthropic\.com.*$\r?\n?', re.MULTILINE)
-                            def msg_callback(msg):
-                                cleaned = pattern.sub(b'', msg)
-                                return cleaned.rstrip() + b'\n' if cleaned.strip() else msg
-                            """;
+        // Write callback script as a standalone Python file
+        var callbackScript = Path.Combine(Path.GetTempPath(), "claude_b_gone_callback.py");
+        var escapedPath = callbackScript.Replace("\\", "\\\\");
+        var scriptContent = @"
+import re
+pattern = re.compile(rb'^\s*[Cc]o-[Aa]uthored-[Bb]y:\s*Claude.*@anthropic\.com.*$\r?\n?', re.MULTILINE)
+def do_clean(msg):
+    cleaned = pattern.sub(b'', msg)
+    return cleaned.rstrip() + b'\n' if cleaned.strip() else msg
+";
         await File.WriteAllTextAsync(callbackScript, scriptContent);
 
         try
         {
-            // git-filter-repo needs to be run directly (not via git)
+            // Use --message-callback with inline code that loads our script
+            var callback = $"exec(open(r'{escapedPath}').read()); return do_clean(message)";
             var (exitCode, output, error) = await RunProcessAsync(
                 filterRepoPath,
-                $"--message-callback \"exec(open(r'{callbackScript.Replace("\\", "\\\\")}').read()); return msg_callback(message)\" --force --refs {branch}",
-                repoPath, timeoutSeconds: 600);
+                $"--message-callback \"{callback}\" --force",
+                repoPath, timeoutSeconds: 1800, lineProgress: progress);
 
             if (exitCode != 0)
             {
-                progress?.Report($"git-filter-repo failed (exit {exitCode}), falling back to filter-branch...");
+                progress?.Report($"git-filter-repo failed (exit {exitCode}): {error.Trim()}");
+                progress?.Report("Falling back to filter-branch...");
                 return await RewriteWithFilterBranchAsync(repoPath, branch, progress);
             }
 
-            // filter-repo doesn't report per-commit, estimate from the scan
             var lines = $"{output}\n{error}".Split('\n');
             var rewritten = lines.Count(l => l.Contains("New ") || l.Contains("rewritten"));
             return (rewritten, $"{output}\n{error}".Trim());
@@ -186,13 +216,18 @@ public class GitService
     private async Task<(int rewritten, string output)> RewriteWithFilterBranchAsync(
         string repoPath, string branch, IProgress<string>? progress)
     {
-        progress?.Report("Using git filter-branch (this may take a while for large repos)...");
+        progress?.Report("Rewriting commit messages...");
+
+        // Set env var to squelch the filter-branch warning (it clutters progress output)
+        Environment.SetEnvironmentVariable("FILTER_BRANCH_SQUELCH_WARNING", "1");
 
         var sedPattern = @"/^[[:space:]]*[Cc]o-[Aa]uthored-[Bb]y:.*Claude.*@anthropic\.com/d";
         var filterCmd = $"filter-branch --force --msg-filter \"sed '{sedPattern}'\" -- {branch}";
 
+        // Use direct callback for immediate UI updates (Progress<T> batches/drops)
         var (exitCode, output, error) = await RunProcessAsync(
-            "git", filterCmd, repoPath, timeoutSeconds: 600, lineProgress: progress);
+            "git", filterCmd, repoPath, timeoutSeconds: 1800,
+            directLineCallback: line => progress?.Report(line));
 
         if (exitCode != 0)
         {
@@ -210,7 +245,10 @@ public class GitService
 
     public async Task<(bool success, string output)> ForcePushAsync(string repoPath, string branch)
     {
-        var (exitCode, output, error) = await RunGitAsync(repoPath, $"push --force-with-lease origin {branch}", timeoutSeconds: 120);
+        // Use --force instead of --force-with-lease because after filter-branch/filter-repo
+        // the tracking info is stale and --force-with-lease will always reject.
+        // Safety is provided by the backup branch created before rewriting.
+        var (exitCode, output, error) = await RunGitAsync(repoPath, $"push --force origin {branch}", timeoutSeconds: 120);
         return (exitCode == 0, exitCode == 0 ? output : error);
     }
 
@@ -268,7 +306,7 @@ public class GitService
 
         var filterCmd = $"filter-branch --force --env-filter \"{envFilter}\" -- {branch}";
         var (exitCode, output, error) = await RunProcessAsync(
-            "git", filterCmd, repoPath, timeoutSeconds: 600, lineProgress: progress);
+            "git", filterCmd, repoPath, timeoutSeconds: 1800, lineProgress: progress);
 
         if (exitCode != 0)
         {
@@ -287,14 +325,15 @@ public class GitService
         string repoPath, string branch, string newName, string newEmail,
         string filterRepoPath, IProgress<string>? progress)
     {
-        progress?.Report("Using git-filter-repo to rewrite authors (fast mode)...");
+        progress?.Report("Rewriting commit authors...");
+
+        // Save origin URL before filter-repo removes it
+        var originUrl = await GetRemoteUrlAsync(repoPath);
 
         // Use mailmap approach - create a mailmap file
         var mailmapPath = Path.Combine(repoPath, ".mailmap-claude-b-gone");
         var mailmapContent = $"{newName} <{newEmail}> Claude <noreply@anthropic.com>\n" +
                              $"{newName} <{newEmail}> claude <noreply@anthropic.com>\n";
-
-        // Also match any author with anthropic.com email
         mailmapContent += $"{newName} <{newEmail}> <noreply@anthropic.com>\n";
 
         await File.WriteAllTextAsync(mailmapPath, mailmapContent);
@@ -303,14 +342,21 @@ public class GitService
         {
             var (exitCode, output, error) = await RunProcessAsync(
                 filterRepoPath,
-                $"--mailmap \"{mailmapPath}\" --force --refs {branch}",
+                $"--mailmap \"{mailmapPath}\" --force",
                 repoPath, timeoutSeconds: 600);
 
             if (exitCode != 0)
             {
-                progress?.Report($"git-filter-repo author rewrite failed (exit {exitCode}), falling back...");
-                // Clean up and fall back
+                progress?.Report($"git-filter-repo author rewrite failed (exit {exitCode}): {error.Trim()}");
+                progress?.Report("Falling back to filter-branch for author rewrite...");
                 throw new InvalidOperationException($"git-filter-repo failed: {error}");
+            }
+
+            // filter-repo removes the origin remote by default — restore it
+            if (originUrl != null)
+            {
+                progress?.Report("Restoring origin remote...");
+                await RunGitAsync(repoPath, $"remote add origin {originUrl}");
             }
 
             return (0, $"{output}\n{error}".Trim());
@@ -322,6 +368,57 @@ public class GitService
     }
 
     private static string EscapeShell(string value) => value.Replace("'", "'\\''");
+
+    public async Task<string> CleanupFilterBranchLeftoversAsync(string repoPath, IProgress<string>? progress = null)
+    {
+        var cleaned = new List<string>();
+
+        // Remove .git-rewrite directory
+        var rewriteDir = Path.Combine(repoPath, ".git-rewrite");
+        if (Directory.Exists(rewriteDir))
+        {
+            Directory.Delete(rewriteDir, true);
+            cleaned.Add(".git-rewrite");
+            progress?.Report("Removed .git-rewrite directory");
+        }
+
+        // Remove refs/original (backup refs created by filter-branch)
+        var (exitCode, output, _) = await RunGitAsync(repoPath, "for-each-ref --format=%(refname) refs/original/");
+        if (exitCode == 0 && !string.IsNullOrWhiteSpace(output))
+        {
+            var refs = output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var refName in refs)
+            {
+                await RunGitAsync(repoPath, $"update-ref -d {refName}");
+            }
+            cleaned.Add($"refs/original ({refs.Length} ref(s))");
+            progress?.Report($"Removed {refs.Length} refs/original backup ref(s)");
+        }
+
+        // Remove backup branches created by claude-b-gone
+        var (branchExit, branchOutput, _) = await RunGitAsync(repoPath, "branch --list pre-claude-b-gone-*");
+        if (branchExit == 0 && !string.IsNullOrWhiteSpace(branchOutput))
+        {
+            var branches = branchOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var b in branches)
+            {
+                var branchName = b.TrimStart('*', ' ');
+                await RunGitAsync(repoPath, $"branch -D {branchName}");
+            }
+            cleaned.Add($"backup branches ({branches.Length})");
+            progress?.Report($"Removed {branches.Length} backup branch(es)");
+        }
+
+        // Run gc to clean up
+        progress?.Report("Running git gc...");
+        await RunGitAsync(repoPath, "reflog expire --expire=now --all", timeoutSeconds: 60);
+        await RunGitAsync(repoPath, "gc --prune=now --aggressive", timeoutSeconds: 120);
+        cleaned.Add("git gc");
+
+        return cleaned.Count > 0
+            ? $"Cleaned: {string.Join(", ", cleaned)}"
+            : "Nothing to clean up.";
+    }
 
     public async Task<string?> GetRemoteUrlAsync(string repoPath)
     {
@@ -335,11 +432,11 @@ public class GitService
         var repoName = url.Split('/').Last().Replace(".git", "");
         var clonePath = Path.Combine(targetDir, repoName);
 
-        // Clean up if it already exists
+        // Clean up if it already exists (git objects are often read-only)
         if (Directory.Exists(clonePath))
         {
             progress?.Report($"Removing existing directory: {clonePath}");
-            Directory.Delete(clonePath, true);
+            ForceDeleteDirectory(clonePath);
         }
 
         Directory.CreateDirectory(targetDir);
@@ -354,6 +451,18 @@ public class GitService
         return clonePath;
     }
 
+    public static void ForceDeleteDirectory(string path)
+    {
+        // Clear read-only attributes on all files first (git objects are read-only)
+        foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+        {
+            var attrs = File.GetAttributes(file);
+            if (attrs.HasFlag(FileAttributes.ReadOnly))
+                File.SetAttributes(file, attrs & ~FileAttributes.ReadOnly);
+        }
+        Directory.Delete(path, true);
+    }
+
     private static Task<(int exitCode, string output, string error)> RunGitAsync(
         string workingDir, string arguments, int timeoutSeconds = 30)
     {
@@ -362,7 +471,7 @@ public class GitService
 
     private static async Task<(int exitCode, string output, string error)> RunProcessAsync(
         string fileName, string arguments, string workingDir, int timeoutSeconds = 30,
-        IProgress<string>? lineProgress = null)
+        IProgress<string>? lineProgress = null, Action<string>? directLineCallback = null)
     {
         using var process = new Process();
         process.StartInfo = new ProcessStartInfo
@@ -378,15 +487,16 @@ public class GitService
 
         process.Start();
 
-        // If we have a progress reporter, stream stderr line by line (filter-branch writes progress there)
-        if (lineProgress != null)
+        var callback = directLineCallback ?? (lineProgress != null ? lineProgress.Report : null);
+
+        // If we have a callback, stream stderr char-by-char
+        // (git filter-branch uses \r not \n for progress lines)
+        if (callback != null)
         {
             var outputTask = process.StandardOutput.ReadToEndAsync();
             var errorLines = new System.Text.StringBuilder();
 
-            // Read stderr char-by-char because git filter-branch uses \r (not \n)
-            // to overwrite progress lines in-place
-            _ = Task.Run(async () =>
+            var stderrTask = Task.Run(async () =>
             {
                 var buffer = new char[1];
                 var lineBuffer = new System.Text.StringBuilder();
@@ -395,7 +505,7 @@ public class GitService
                 while (true)
                 {
                     var charsRead = await reader.ReadAsync(buffer, 0, 1);
-                    if (charsRead == 0) break; // EOF
+                    if (charsRead == 0) break;
 
                     var ch = buffer[0];
                     if (ch == '\r' || ch == '\n')
@@ -404,7 +514,7 @@ public class GitService
                         {
                             var line = lineBuffer.ToString();
                             errorLines.AppendLine(line);
-                            lineProgress.Report(line);
+                            callback(line);
                             lineBuffer.Clear();
                         }
                     }
@@ -414,12 +524,11 @@ public class GitService
                     }
                 }
 
-                // Flush remaining
                 if (lineBuffer.Length > 0)
                 {
                     var line = lineBuffer.ToString();
                     errorLines.AppendLine(line);
-                    lineProgress.Report(line);
+                    callback(line);
                 }
             });
 
@@ -430,6 +539,7 @@ public class GitService
                 return (-1, "", "Process timed out");
             }
 
+            await stderrTask; // Ensure we've read all stderr before returning
             var output = await outputTask;
             return (process.ExitCode, output, errorLines.ToString());
         }
